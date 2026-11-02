@@ -11,7 +11,7 @@ from midealan.devices.toshiba import (
     decode_toshiba_washer_status,
 )
 from midealan.exceptions import ValueWrongType
-from midealan.message import MessageRequest, MessageType, ToshibaFrame
+from midealan.message import MessageRequest, MessageResponse, MessageType, ToshibaFrame
 
 from .message import (
     PROFILE_MODEL,
@@ -34,6 +34,12 @@ _LOGGER = logging.getLogger(__name__)
 TOSHIBA_MODE_OFFSET = 2
 TOSHIBA_PROGRAM_OFFSET = 3
 TOSHIBA_TEMPERATURE_OFFSET = 14
+CONSUMPTION_MODEL = "38132406"
+CONSUMPTION_SUBTYPE = 19504
+CONSUMPTION_BODY_TYPE = 0x05
+CONSUMPTION_BODY_LENGTH = 5
+WATER_SCALE = 10
+ENERGY_SCALE = 1000
 
 
 class DeviceAttributes(StrEnum):
@@ -73,6 +79,8 @@ class DeviceAttributes(StrEnum):
     forget_free = "forget_free"
     stains = "stains"
     dirty_degree = "dirty_degree"
+    last_cycle_water_consumption = "last_cycle_water_consumption"
+    last_cycle_energy_consumption = "last_cycle_energy_consumption"
 
 
 class MideaDBDevice(MideaDevice):
@@ -286,6 +294,8 @@ class MideaDBDevice(MideaDevice):
                 DeviceAttributes.wash_time_value: None,
                 DeviceAttributes.dehydration_time_value: None,
                 DeviceAttributes.dirty_degree: None,
+                DeviceAttributes.last_cycle_water_consumption: None,
+                DeviceAttributes.last_cycle_energy_consumption: None,
             },
         )
 
@@ -321,9 +331,30 @@ class MideaDBDevice(MideaDevice):
         status = self.process_toshiba_message(msg)
         if status is not None:
             return status
+        # A standard response needs a header, body type and checksum.
+        if len(msg) < MessageResponse.HEADER_LENGTH + 2:
+            return {}
+        if msg[MessageResponse.HEADER_LENGTH - 1] not in MessageType:
+            return {}
         message = MessageDBResponse(msg)
         _LOGGER.debug("[%s] Received: %s", self.device_id, message)
-        new_status = {}
+        new_status: dict[str, Any] = {}
+
+        # Empirical scaling from one finished cycle; estimates, not totals.
+        if (
+            self.model == CONSUMPTION_MODEL
+            and self.subtype == CONSUMPTION_SUBTYPE
+            and message.message_type == MessageType.notify1
+            and message.body_type == CONSUMPTION_BODY_TYPE
+            and len(message.body) >= CONSUMPTION_BODY_LENGTH
+        ):
+            new_status[DeviceAttributes.last_cycle_water_consumption] = (
+                int.from_bytes(message.body[1:3], "little") / WATER_SCALE
+            )
+            new_status[DeviceAttributes.last_cycle_energy_consumption] = (
+                int.from_bytes(message.body[3:5], "little") / ENERGY_SCALE
+            )
+            self._attributes.update(new_status)
 
         for attr in self._attributes:
             if hasattr(message, str(attr)):

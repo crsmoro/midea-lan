@@ -85,6 +85,121 @@ def toshiba_body() -> bytearray:
     return body
 
 
+def test_last_cycle_estimates_from_observed_payload() -> None:
+    """Only the five body bytes are correlated with one real completed cycle."""
+    device = MideaDBDevice(customize="", **device_args("38132406", 19504))
+    # Header and checksum are synthetic; this is not a complete captured frame.
+    status = device.process_message(
+        frame(bytes.fromhex("05 ca 01 0a 00"), MessageType.notify1),
+    )
+    assert status.get("last_cycle_water_consumption") == 45.8
+    assert status.get("last_cycle_energy_consumption") == 0.01
+
+
+@pytest.mark.parametrize("message", [b"", b"\xaa" * 9, frame(b"", MessageType.notify1)])
+def test_invalid_short_frames_do_not_update_consumption(message: bytes) -> None:
+    """Malformed or missing headers and bodies are rejected without state loss."""
+    device = MideaDBDevice(customize="", **device_args("38132406", 19504))
+    device.process_message(frame(bytes.fromhex("05 ca 01 0a 00"), MessageType.notify1))
+    assert device.process_message(message) == {}
+    assert device.attributes[DeviceAttributes.last_cycle_water_consumption] == 45.8
+    assert device.attributes[DeviceAttributes.last_cycle_energy_consumption] == 0.01
+
+
+def test_unknown_message_type_is_rejected() -> None:
+    """An unknown response type must not change stored values."""
+    device = MideaDBDevice(customize="", **device_args("38132406", 19504))
+    invalid = bytearray(frame(bytes.fromhex("05 ca 01 0a 00"), MessageType.notify1))
+    invalid[9] = 0xFF
+    assert device.process_message(bytes(invalid)) == {}
+    assert device.attributes[DeviceAttributes.last_cycle_water_consumption] is None
+
+
+@pytest.mark.parametrize(
+    ("model", "subtype"),
+    [("38132406", 19503), ("38132407", 19504), ("", 19504)],
+)
+def test_other_models_do_not_expose_consumption(model: str, subtype: int) -> None:
+    """Do not infer units for devices outside the observed model and subtype."""
+    device = MideaDBDevice(customize="", **device_args(model, subtype))
+    status = device.process_message(
+        frame(bytes.fromhex("05 ca 01 0a 00"), MessageType.notify1),
+    )
+    assert DeviceAttributes.last_cycle_water_consumption not in status
+    assert DeviceAttributes.last_cycle_energy_consumption not in status
+    assert device.attributes[DeviceAttributes.last_cycle_water_consumption] is None
+    assert device.attributes[DeviceAttributes.last_cycle_energy_consumption] is None
+
+
+@pytest.mark.parametrize("length", range(1, 5))
+def test_truncated_consumption_body_preserves_values(length: int) -> None:
+    """The body must include both complete little-endian values."""
+    device = MideaDBDevice(customize="", **device_args("38132406", 19504))
+    device.process_message(frame(bytes.fromhex("05 ca 01 0a 00"), MessageType.notify1))
+    assert (
+        device.process_message(
+            frame(bytes.fromhex("05 00 00 00 00")[:length], MessageType.notify1),
+        )
+        == {}
+    )
+    assert device.attributes[DeviceAttributes.last_cycle_water_consumption] == 45.8
+    assert device.attributes[DeviceAttributes.last_cycle_energy_consumption] == 0.01
+
+
+@pytest.mark.parametrize(
+    "message_type",
+    [MessageType.set, MessageType.query, MessageType.notify2, MessageType.exception],
+)
+def test_other_message_types_do_not_update_consumption(
+    message_type: MessageType,
+) -> None:
+    """Only a 0x04 notification carries the consumption interpretation."""
+    device = MideaDBDevice(customize="", **device_args("38132406", 19504))
+    status = device.process_message(
+        frame(bytes.fromhex("05 ca 01 0a 00"), message_type),
+    )
+    assert DeviceAttributes.last_cycle_water_consumption not in status
+    assert DeviceAttributes.last_cycle_energy_consumption not in status
+
+
+def test_cycle_values_survive_status_then_update_including_zero() -> None:
+    """Normal status does not reset a report; later reports replace, not add."""
+    device = MideaDBDevice(customize="", **device_args("38132406", 19504))
+    water = DeviceAttributes.last_cycle_water_consumption
+    energy = DeviceAttributes.last_cycle_energy_consumption
+    assert device.attributes[water] is None
+    assert device.attributes[energy] is None
+    device.process_message(frame(bytes.fromhex("05 ca 01 0a 00"), MessageType.notify1))
+    status = device.process_message(frame(DB_BODY, MessageType.query))
+    assert water not in status
+    assert energy not in status
+    assert device.attributes[water] == 45.8
+    assert device.attributes[energy] == 0.01
+    status = device.process_message(
+        frame(bytes.fromhex("05 00 00 00 00"), MessageType.notify1),
+    )
+    assert status[water] == 0
+    assert status[energy] == 0
+    status = device.process_message(
+        frame(bytes.fromhex("05 34 12 78 56"), MessageType.notify1),
+    )
+    assert status[water] == 0x1234 / 10
+    assert status[energy] == 0x5678 / 1000
+    assert device.attributes[water] == status[water]
+    assert device.attributes[energy] == status[energy]
+
+
+def test_other_body_type_does_not_update_consumption() -> None:
+    """Notification 0x04 with a different body type is not consumption."""
+    device = MideaDBDevice(customize="", **device_args("38132406", 19504))
+    device.process_message(frame(bytes.fromhex("05 ca 01 0a 00"), MessageType.notify1))
+    status = device.process_message(frame(DB_RESERVED, MessageType.notify1))
+    assert DeviceAttributes.last_cycle_water_consumption not in status
+    assert DeviceAttributes.last_cycle_energy_consumption not in status
+    assert device.attributes[DeviceAttributes.last_cycle_water_consumption] == 45.8
+    assert device.attributes[DeviceAttributes.last_cycle_energy_consumption] == 0.01
+
+
 class TestMideaDBDevice:
     """Test Midea DB Device."""
 
