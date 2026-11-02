@@ -14,7 +14,12 @@ from midealan.devices.db.message import (
     MessageStart,
 )
 from midealan.exceptions import ValueWrongType
-from midealan.message import MessageType, ToshibaMessageRequest, encode_toshiba_frame
+from midealan.message import (
+    MessageQuestCustom,
+    MessageType,
+    ToshibaMessageRequest,
+    encode_toshiba_frame,
+)
 
 DB_BODY = bytes.fromhex(
     "030101001f0520010300030400400000204f0000db5933b10000002d08080000"
@@ -56,8 +61,14 @@ def frame(
     body: bytes | bytearray,
     message_type: MessageType = MessageType.query,
 ) -> bytes:
-    """Use an identity-free header; direct decoders do not validate its checksum."""
-    return bytes([0xAA] + [0] * 7 + [ProtocolVersion.V1, message_type]) + body + b"\x00"
+    """Build a synthetic AA frame using the same framing as MessageRequest."""
+    request = MessageQuestCustom(
+        DeviceType.DB,
+        ProtocolVersion.V1,
+        message_type,
+        bytearray(body),
+    )
+    return bytes(request.serialize())
 
 
 def verified_washer(body: bytes | bytearray | None = None) -> MideaDBDevice:
@@ -104,6 +115,78 @@ def test_invalid_short_frames_do_not_update_consumption(message: bytes) -> None:
     assert device.process_message(message) == {}
     assert device.attributes[DeviceAttributes.last_cycle_water_consumption] == 45.8
     assert device.attributes[DeviceAttributes.last_cycle_energy_consumption] == 0.01
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        "zero_length",
+        "short_length",
+        "long_length",
+        "checksum",
+        "padded_checksum",
+        "body",
+        "magic",
+        "device",
+    ],
+)
+def test_corrupt_consumption_frame_preserves_all_state(corruption: str) -> None:
+    """Reject invalid envelopes even if they contain readable consumption bytes."""
+    device = MideaDBDevice(customize="", **device_args("38132406", 19504))
+    device.process_message(frame(bytes.fromhex("05 ca 01 0a 00"), MessageType.notify1))
+    before = device.attributes.copy()
+    invalid = bytearray(frame(bytes.fromhex("05 34 12 78 56"), MessageType.notify1))
+    if corruption == "zero_length":
+        invalid[1] = 0
+    elif corruption == "short_length":
+        # A valid checksum for an undersized logical body, followed by padding.
+        invalid = bytearray(frame(bytes.fromhex("05 34 12 78"), MessageType.notify1))
+        invalid.extend(b"\x56\x00")
+    elif corruption == "long_length":
+        invalid[1] = len(invalid)
+    elif corruption == "checksum":
+        invalid[-1] ^= 1
+    elif corruption == "padded_checksum":
+        invalid[-1] ^= 1
+        invalid.extend(b"\x01\x02\x03")
+    elif corruption == "body":
+        invalid[11] ^= 1
+    elif corruption == "magic":
+        invalid[0] = 0
+    elif corruption == "device":
+        invalid[2] = 0xAC
+        invalid[-1] = (-sum(invalid[1:-1])) & 0xFF
+    assert device.process_message(bytes(invalid)) == {}
+    assert device.attributes == before
+
+
+def test_zero_length_review_example_does_not_update_state() -> None:
+    """Regression for the exact malformed frame reported during review."""
+    device = MideaDBDevice(customize="", **device_args("38132406", 19504))
+    before = device.attributes.copy()
+    invalid = bytes.fromhex("aa00db0000000000000405ca010a0000")
+    assert device.process_message(invalid) == {}
+    assert device.attributes == before
+
+
+def test_consumption_frame_rejects_trailing_bytes() -> None:
+    """AES padding is removed before the SDK dispatches a decrypted frame."""
+    device = MideaDBDevice(customize="", **device_args("38132406", 19504))
+    message = frame(bytes.fromhex("05 ca 01 0a 00"), MessageType.notify1)
+    assert device.process_message(message + b"\xa5" * (72 - len(message))) == {}
+    assert device.attributes[DeviceAttributes.last_cycle_water_consumption] is None
+    assert device.attributes[DeviceAttributes.last_cycle_energy_consumption] is None
+
+
+def test_unrelated_status_keeps_legacy_framing_behavior() -> None:
+    """The new 0405 validation does not change regular DB status parsing."""
+    device = MideaDBDevice(customize="", **device_args("38132406", 19504))
+    invalid_envelope = bytearray(frame(DB_BODY, MessageType.query))
+    invalid_envelope[1] = 0
+    invalid_envelope[-1] ^= 1
+    status = device.process_message(bytes(invalid_envelope))
+    assert status[DeviceAttributes.power] is True
+    assert status[DeviceAttributes.status] == "standby"
 
 
 def test_unknown_message_type_is_rejected() -> None:

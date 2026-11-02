@@ -38,6 +38,9 @@ CONSUMPTION_MODEL = "38132406"
 CONSUMPTION_SUBTYPE = 19504
 CONSUMPTION_BODY_TYPE = 0x05
 CONSUMPTION_BODY_LENGTH = 5
+AA_FRAME_MAGIC = 0xAA
+AA_LENGTH_OFFSET = 1
+AA_DEVICE_TYPE_OFFSET = 2
 WATER_SCALE = 10
 ENERGY_SCALE = 1000
 
@@ -336,6 +339,23 @@ class MideaDBDevice(MideaDevice):
             return {}
         if msg[MessageResponse.HEADER_LENGTH - 1] not in MessageType:
             return {}
+        if (
+            self.model == CONSUMPTION_MODEL
+            and self.subtype == CONSUMPTION_SUBTYPE
+            and msg[MessageResponse.HEADER_LENGTH - 1] == MessageType.notify1
+            and msg[MessageResponse.HEADER_LENGTH] == CONSUMPTION_BODY_TYPE
+        ):
+            # Length excludes the initial AA and includes the trailing checksum.
+            end = msg[AA_LENGTH_OFFSET]
+            if (
+                msg[0] != AA_FRAME_MAGIC
+                or msg[AA_DEVICE_TYPE_OFFSET] != DeviceType.DB
+                or end < MessageResponse.HEADER_LENGTH + CONSUMPTION_BODY_LENGTH
+                or end != len(msg) - 1
+                or msg[end] != MessageRequest.checksum(msg[1:end])
+            ):
+                return {}
+            # LocalSecurity.aes_decrypt removes AES padding before dispatch.
         message = MessageDBResponse(msg)
         _LOGGER.debug("[%s] Received: %s", self.device_id, message)
         new_status: dict[str, Any] = {}

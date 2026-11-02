@@ -23,5 +23,9 @@ zero is a valid report. Normal status messages do not clear them.
   are synthetic too. No other cycle or model is validated by this evidence.
   No device access was performed for this implementation.
 
-The existing transport handles framing/checksums. Direct response-parser tests
-use synthetic frames and do not establish transport-level checksum validation.
+The `0405` decoder for this model validates the `AA DB` header, declared
+length and additive checksum before changing state. It rejects trailing bytes:
+`LocalSecurity.aes_decrypt` removes AES padding before dispatch. This framing
+was verified against an actual 72-byte status response; the complete 0405
+notification was not retained, so its framing still needs device validation.
+Other messages retain their existing parsing behavior.
